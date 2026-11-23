@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+checkpoints/*
+!checkpoints/maze_5x5_hier_best.zip
