@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Maze Hier-RL Banner" width="100%" />
+<img src="assets/hero.svg" alt="Maze Hier-RL Animated Banner" width="100%" />
 
 <br />
 
@@ -13,60 +13,45 @@
   <img src="https://img.shields.io/badge/Target-ESP32--S3-8B5CF6?style=flat-square&logo=espressif&logoColor=white" />
 </p>
 
-<!-- Epic 3D simulation cinematic video snapshot (high motion rendering preview) -->
-<img src="image_2.png" alt="3D Cinematic Active Simulation Visualization" width="100%" />
-
-<sub>Autonomous 3D micro-robot <i>(maze_buggy)</i> actively navigating corridor turns. <b>0 Wall collisions</b> • <b>0 Global map cheating</b>.</sub>
-
 </div>
 
 ---
 
-## ⚡ Active Cinematic Telemetry
-
-The hierarchical split isolates motor friction and inertial dynamics from the navigation model. Here are the system's target quantitative metrics:
+## Quantitative Highlights
 
 <div align="center">
-  <img src="assets/metrics.svg" alt="Animated Visual telemetry" width="100%" />
+  <img src="assets/metrics.svg" alt="Animated System Telemetry Dashboard" width="100%" />
 </div>
 
 <br />
 
-| Component | Engineering Parameters | Quantitative Performance |
+| Category | Specification | Measured Value |
 | :--- | :--- | :--- |
-| **High-Level Decision Brain** | Deep recurrent `MlpLstmPolicy`<br/>128 LSTM Units + 64 MLP Layers | **94%+** solve rate on 320 unseen 5×5 grids<br/>**~21 avg moves** • Zero failures under noise |
-| **Edge Footprint** | Static neural footprint<br/>`85.3k` parameters, FP32 accuracy | **~341 KB** Flash memory consumption<br/>**~3 ms** inference latency per cell on ESP32-S3 |
-| **Proximity Sensing** | 6× active rangefinders<br/>ToF narrow 25° field-of-view | **1.2 m** cutoff threshold<br/>**0 wall collisions** across entire benchmark |
-| **Closed-Loop Actuation** | Multithreaded Z-Gyro + encoder feedback<br/>Double casters shimmed `0.5 mm` higher | **200 Hz** motion primitive controller (`5 ms` timesteps)<br/>**0.30 m** stride length • **0.12 m** track width |
-| **Physics Alignment** | Sub-millimeter differential stability<br/>`priority="1"` contact-priority override | **100% solve rate** on Right-Hand Rule primitive<br/>Eliminated **58%** wheel-slip & guard sticking |
+| **Navigation Performance** | Procedural 5×5 Solve Rate / Avg Moves | **94%+** / **~21 moves** (`10` moves on unseen test) |
+| **Safety** | Wall Collision Tick Hits | **0** |
+| **Training Efficiency** | Timesteps / CPU Wall-Clock Time | **120,000 steps** / **~19 min** (`8` envs, `320` mazes) |
+| **Policy Interface** | Observation / Action Space | **20-dim** local vector / **Discrete(4)** (`F, L, R, B`) |
+| **Low-Level Control** | PID Loop Rate / Cell Stride | **200 Hz** (`5 ms` tick) / **0.30 m** cell step |
+| **Robot Kinematics** | Chassis / Wheels / Track Width | **120 × 96 mm** / **r = 0.03 m** / **L = 0.12 m** |
+| **Sensor Suite** | Laser Rangefinders / Cutoff | **6× ToF** (`4` cardinal + `2` diagonal) / **1.2 m** |
+| **Edge Deployment** | LSTM Actor Size / Latency | **~341 KB** (`85.3k` FP32 params) / **~3 ms/cell** on ESP32-S3 |
 
 ---
 
-## 🧠 Architectural Overview
+## Architecture
 
-Decoupling high-level strategic exploration from high-frequency physical execution allows the robot to handle complex labyrinths without global coordinate tracking:
+The system decouples **strategic maze exploration** from **precise physical motion** into a two-tier hierarchy. Separating decision-making from actuation eliminates wall-grazing failures, accelerates RL convergence, and allows the same policy to scale zero-shot to larger grids or deploy directly to embedded hardware.
 
-```mermaid
-flowchart LR
-    OBS["1 · Local Perception<br/>20-Dim Sensory-Memory Frame"] 
-    RL["2 · High-Level Policy<br/>RecurrentPPO (LSTM) → [F / L / R / B]"]
-    PID["3 · Motion Controller<br/>200 Hz Gyro-Stabilized PID"]
-    SIM["4 · MuJoCo Physics Sandbox<br/>Double-Casters (priority=1) • 6x ToF"]
+<div align="center">
+  <img src="assets/architecture.svg" alt="Animated Hierarchical RL + PID Architecture Flowchart" width="100%" />
+</div>
 
-    OBS -->|"20x1 Vector"| RL
-    RL -->|"Cell Command"| PID
-    PID -->|"Left/Right Wheel Velocity"| SIM
-    SIM -.->|"Incremental Odometry & laser returns"| OBS
+<br />
 
-    style OBS fill:#050b1a,stroke:#38bdf8,stroke-width:1.5px,color:#f8fafc
-    style RL fill:#1e1b4b,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc
-    style PID fill:#022c22,stroke:#34d399,stroke-width:1.5px,color:#f8fafc
-    style SIM fill:#0f172a,stroke:#94a3b8,stroke-width:1.5px,color:#cbd5e1
-```
-
-- **Perception Layer (`Box(20)`):** Processes live range data from the ToF laser suite, an binary open-direction corridor mask, visual visited tracking, the goal target vector, and gyro angular orientation.
-- **Recurrent Strategist (`RecurrentPPO`):** Tracks its exploration history in real-time, mapping a route through the maze. Because it is purely local, the brain can scale zero-shot to any maze scale (e.g. `7×7` or `9×9` grid) without further training.
-- **Differential Mover (`PID`):** Smooths out physical execution. Translates single moves into deterministic, gyro-stabilized, 90° in-place cardinal turns and `0.30 m` drives, maintaining the absolute center of the corridor. It uses the `fl` and `fr` sensors as safety reflexes to prevent wall scraping.
+- **Local Perception (`20-Dim`):** Never receives the global wall map. At each cell, the robot builds a local vector from 4 cardinal rangefinders (`1.2 m` cutoff), binary open-corridor flags, odometry-tracked visited cell counts, a body-frame goal bearing vector, and its gyro heading.
+- **High-Level Policy (`RecurrentPPO`):** A 128-unit LSTM evaluates the local state once per cell and outputs a relative `Discrete(4)` command (**Forward, Left, Right, or Back**), using its hidden state and breadcrumb memory to backtrack out of dead ends.
+- **Low-Level Controller (`200 Hz PID`):** Filters blocked directions before motion starts. Valid moves run in two deterministic phases: an **in-place 90°/180° gyro-locked turn**, followed by a **`0.30 m` corridor drive** with side-wall centering and front-wall distance re-zeroing to cancel encoder drift.
+- **Physics & Hardware Transfer:** Low-friction skids lifted `0.5 mm` (`z = -0.0195 m`) and side guards use contact priority tuning (`priority="1"`) so floor friction never brakes the drive wheels—mirroring ball casters on a physical **ESP32-S3 + VL53L0X + N20 encoder** build.
 
 <div align="center">
   <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f172a,50:0284c7,100:10b981&height=90&section=footer" width="100%" />
