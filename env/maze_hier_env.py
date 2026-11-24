@@ -1,24 +1,31 @@
-from collections import deque
+import math
 import time
+import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
-import numpy as np
 
 from sim.scene_builder import build_maze_scene
-from sim.pid_controller import DifferentialPID
-
-DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # 0=E, 1=N, 2=W, 3=S
-ACTION_DH = [0, 1, -1, 2]                  # 0=Fwd, 1=Left, 2=Right, 3=Back
-ACTION_PROX = [0, 1, 2, 5]                 # indices into prox_names
 
 
-def wrap_angle(a: float) -> float:
-    return float(np.arctan2(np.sin(a), np.cos(a)))
+def _wrap_angle(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 class MazeHierEnv(gym.Env):
+    """
+    Hierarchical MuJoCo maze navigation environment.
+    - High-level policy: Discrete(4) relative cell moves [Forward, Left, Right, Back]
+    - Low-level controller: High-speed 200 Hz PD-damped turns + front-wall-aware 0.30 m drives
+    - Includes Lookahead Cruise-Through for non-stop multi-cell straightaways.
+    """
+
     metadata = {"render_modes": ["human"]}
+
+    # Cardinal headings: 0=East (+x), 1=North (+y), 2=West (-x), 3=South (-y)
+    HEADING_DC_DR = [(1, 0), (0, 1), (-1, 0), (0, -1)]  # (dc, dr)
+    HEADING_YAW = [0.0, 0.5 * math.pi, math.pi, -0.5 * math.pi]
+    REL_DELTA_H = [0, 1, 3, 2]  # 0:F, 1:L (+90), 2:R (-90), 3:B (180)
 
     def __init__(
         self,
@@ -27,357 +34,538 @@ class MazeHierEnv(gym.Env):
         cols: int = 5,
         cell_size: float = 0.30,
         pool_size: int = 40,
-        max_steps: int = 80,
-        noise_enabled: bool = True,
         base_seed: int = 0,
-        viewer=None,
+        max_moves: int = 80,
+        noise_enabled: bool = False,
         render_realtime: bool = False,
+        cruise_speed: float = 0.62,
+        brake_dist: float = 0.10,
+        accel: float = 2.0,
     ):
         super().__init__()
+        self.buggy_xml_path = buggy_xml_path
         self.rows = rows
         self.cols = cols
         self.cell_size = cell_size
-        self.max_steps = max_steps
+        self.pool_size = max(1, pool_size)
+        self.base_seed = base_seed
+        self.max_moves = max_moves
         self.noise_enabled = noise_enabled
-        self.max_range = 1.2
-        self.dt = 0.005
-        self.viewer = viewer
         self.render_realtime = render_realtime
 
-        self.prox_names = [
-            "bot/rf_front",
-            "bot/rf_left",
-            "bot/rf_right",
-            "bot/rf_fl",
-            "bot/rf_fr",
-            "bot/rf_back",
-        ]
+        # High-speed motion profile defaults
+        self.cruise_speed = cruise_speed
+        self.brake_dist = brake_dist
+        self.accel = accel
 
-        self.pool = []
-        for i in range(pool_size):
-            model, data, maze = build_maze_scene(
-                buggy_xml_path=buggy_xml_path,
-                rows=rows,
-                cols=cols,
-                cell_size=cell_size,
-                seed=base_seed + i,
-            )
-            wall_ids = {
-                g for g in range(model.ngeom)
-                if (model.geom(g).name or "").startswith("wall_")
-            }
-            bot_ids = {
-                g for g in range(model.ngeom)
-                if (model.geom(g).name or "").startswith("bot/")
-            }
-            bfs_dist = self._build_bfs(model, data, maze, wall_ids)
-            self.pool.append((model, data, maze, wall_ids, bot_ids, bfs_dist))
-
-        self.sensor_off = self._measure_sensor_offsets(*self.pool[0][:2])
-        half_clear = 0.5 * (self.cell_size - 0.02)
-        self.front_center = max(0.035, half_clear - self.sensor_off[0])
-        self.side_center = max(0.035, half_clear - 0.5 * (self.sensor_off[1] + self.sensor_off[2]))
-        self.open_thresh = np.array([
-            half_clear - self.sensor_off[i] + 0.07 for i in ACTION_PROX
-        ], dtype=np.float32)
+        # Kinematics & sensor geometry (matches assets/my_buggy.xml)
+        self.wheel_radius = 0.03
+        self.track_width = 0.12
+        self.max_wheel_vel = 35.0
+        self.sensor_off = 0.065
+        self.max_range = 1.20
+        self.open_thresh = self.cell_size * 0.72
+        self.front_center = 0.5 * self.cell_size - self.sensor_off
+        self.side_center = 0.5 * self.cell_size - self.sensor_off
 
         self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(20,), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(20,), dtype=np.float32
+        )
 
         self.rng = np.random.default_rng(base_seed)
-        self.pid = DifferentialPID(dt=self.dt)
+        self.viewer = None
         self.model = None
         self.data = None
         self.maze = None
-        self.wall_ids = set()
-        self.bot_ids = set()
-        self.bfs_dist = None
-        self._tick = 0
 
-    def _measure_sensor_offsets(self, model, data):
-        mujoco.mj_resetData(model, data)
-        mujoco.mj_forward(model, data)
-        bpos = data.body("bot/buggy").xpos[:2]
-        offs = []
-        for name in self.prox_names:
-            sid = int(model.sensor_objid[model.sensor(name).id])
-            offs.append(float(np.linalg.norm(data.site_xpos[sid][:2] - bpos)))
-        return offs
+        # Cached MuJoCo IDs
+        self._sensor_adr = {}
+        self._act_l = -1
+        self._act_r = -1
+        self._dof_l = -1
+        self._dof_r = -1
+        self._wall_geom_ids = set()
+        self._bot_geom_ids = set()
 
-    def _build_bfs(self, model, data, maze, wall_ids):
-        mujoco.mj_resetData(model, data)
-        free_jnts = np.where(model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)[0]
-        if len(free_jnts) > 0:
-            data.qpos[int(model.jnt_qposadr[free_jnts[0]]) + 2] = 5.0
-        mujoco.mj_forward(model, data)
-
-        adj = {(r, c): [] for r in range(self.rows) for c in range(self.cols)}
-        geomid = np.zeros(1, dtype=np.int32)
-        for r in range(self.rows):
-            for c in range(self.cols):
-                pnt = np.array([(c + 0.5) * self.cell_size, (r + 0.5) * self.cell_size, 0.04])
-                for dr, dc in DIRS:
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < self.rows and 0 <= nc < self.cols:
-                        vec = np.array([float(dc), float(dr), 0.0])
-                        d = mujoco.mj_ray(model, data, pnt, vec, None, 1, -1, geomid)
-                        if not (0.0 <= d < self.cell_size and int(geomid[0]) in wall_ids):
-                            adj[(r, c)].append((nr, nc))
-        mujoco.mj_resetData(model, data)
-
-        goal_cell = self._clamped_cell(*maze["goal_xy"])
-        bfs = np.full((self.rows, self.cols), 999, dtype=np.int32)
-        bfs[goal_cell] = 0
-        q = deque([goal_cell])
-        while q:
-            r, c = q.popleft()
-            for nr, nc in adj[(r, c)]:
-                if bfs[nr, nc] > bfs[r, c] + 1:
-                    bfs[nr, nc] = bfs[r, c] + 1
-                    q.append((nr, nc))
-        return bfs
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
-
-        idx = int(self.rng.integers(len(self.pool)))
-        self.model, self.data, self.maze, self.wall_ids, self.bot_ids, self.bfs_dist = self.pool[idx]
-
-        mujoco.mj_resetData(self.model, self.data)
-        mujoco.mj_forward(self.model, self.data)
-
-        sx, sy = self.maze["start_xy"]
-        self.pid.reset(x=sx, y=sy, theta=0.0)
-
-        self.odom_r, self.odom_c = self._clamped_cell(sx, sy)
+        # Episode state
+        self.odom_r = 0
+        self.odom_c = 0
         self.odom_h = 0
-        self.step_count = 0
-        self.collision_steps = 0
-        self.tick_collisions = 0
-        self._tick = 0
+        self.odom_yaw = 0.0
+        self.goal_r = 0
+        self.goal_c = 0
+        self.visited_counts = {}
+        self.moves = 0
+        self.wall_hits = 0
+        self.collision_moves = 0
+        self._move_wall_hits = 0
 
-        start_true = self._clamped_cell(*self._true_xy())
-        self.min_bfs = int(self.bfs_dist[start_true])
-        self.visited_true = {start_true}
-        self.visit_counts = {(self.odom_r, self.odom_c): 1}
-        self.goal_cell = self._clamped_cell(*self.maze["goal_xy"])
+    # ------------------------------------------------------------------
+    # MuJoCo ID Resolution & Low-Level I/O
+    # ------------------------------------------------------------------
+    def _resolve_id(self, obj_type, name: str) -> int:
+        for candidate in (f"bot/{name}", name):
+            idx = mujoco.mj_name2id(self.model, obj_type, candidate)
+            if idx != -1:
+                return idx
+        raise KeyError(
+            f"MuJoCo object '{name}' not found (checked 'bot/{name}' and '{name}')"
+        )
 
-        return self._get_obs(), {}
+    def _cache_ids(self):
+        sensor_names = [
+            "rf_front", "rf_back", "rf_left", "rf_right",
+            "rf_fl", "rf_fr", "gyro", "enc_left_vel", "enc_right_vel",
+        ]
+        self._sensor_adr = {}
+        for name in sensor_names:
+            try:
+                sid = self._resolve_id(mujoco.mjtObj.mjOBJ_SENSOR, name)
+                self._sensor_adr[name] = int(self.model.sensor_adr[sid])
+            except KeyError:
+                self._sensor_adr[name] = -1
 
-    def _sim_tick(self, v_ref: float, w_ref: float):
-        enc_vl = float(self.data.sensor("bot/enc_left_vel").data[0])
-        enc_vr = float(self.data.sensor("bot/enc_right_vel").data[0])
-        gyro_z = float(self.data.sensor("bot/gyro").data[2])
+        self._act_l = self._resolve_id(mujoco.mjtObj.mjOBJ_ACTUATOR, "left_vel")
+        self._act_r = self._resolve_id(mujoco.mjtObj.mjOBJ_ACTUATOR, "right_vel")
+        jnt_l = int(self.model.actuator_trnid[self._act_l, 0])
+        jnt_r = int(self.model.actuator_trnid[self._act_r, 0])
+        self._dof_l = int(self.model.jnt_dofadr[jnt_l])
+        self._dof_r = int(self.model.jnt_dofadr[jnt_r])
 
+        self._wall_geom_ids = set()
+        self._bot_geom_ids = set()
+        for gid in range(self.model.ngeom):
+            gname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
+            if gname.startswith("wall_"):
+                self._wall_geom_ids.add(gid)
+            elif gname.startswith("bot/"):
+                self._bot_geom_ids.add(gid)
+
+    def _read_rf(self, key: str) -> float:
+        adr = self._sensor_adr.get(key, -1)
+        if adr < 0:
+            return self.max_range
+        val = float(self.data.sensordata[adr])
+        if val < 0.0 or val > self.max_range:
+            val = self.max_range
         if self.noise_enabled:
-            enc_vl += float(self.rng.normal(0.0, 0.05))
-            enc_vr += float(self.rng.normal(0.0, 0.05))
-            gyro_z += float(self.rng.normal(0.0, 0.01))
+            val = float(np.clip(val + self.rng.normal(0.0, 0.006), 0.01, self.max_range))
+        return val
 
-        wl, wr, v_m, w_m = self.pid.step(v_ref, w_ref, enc_vl, enc_vr, gyro_z)
-        self.data.actuator("bot/left_vel").ctrl[0] = wl
-        self.data.actuator("bot/right_vel").ctrl[0] = wr
-        mujoco.mj_step(self.model, self.data)
+    def _read_rangefinders(self) -> dict:
+        return {
+            "front": self._read_rf("rf_front"),
+            "back": self._read_rf("rf_back"),
+            "left": self._read_rf("rf_left"),
+            "right": self._read_rf("rf_right"),
+            "fl": self._read_rf("rf_fl"),
+            "fr": self._read_rf("rf_fr"),
+        }
 
-        hit = self._check_wall_collision()
+    def _read_gyro_z(self) -> float:
+        adr = self._sensor_adr.get("gyro", -1)
+        if adr < 0:
+            return 0.0
+        gz = float(self.data.sensordata[adr + 2])
+        if self.noise_enabled:
+            gz += float(self.rng.normal(0.0, 0.015))
+        return gz
+
+    def _read_forward_speed(self) -> float:
+        adr_l = self._sensor_adr.get("enc_left_vel", -1)
+        adr_r = self._sensor_adr.get("enc_right_vel", -1)
+        if adr_l >= 0 and adr_r >= 0:
+            wl = float(self.data.sensordata[adr_l])
+            wr = float(self.data.sensordata[adr_r])
+        elif self._dof_l >= 0 and self._dof_r >= 0:
+            wl = float(self.data.qvel[self._dof_l])
+            wr = float(self.data.qvel[self._dof_r])
+        else:
+            return 0.0
+        if self.noise_enabled:
+            wl += float(self.rng.normal(0.0, 0.08))
+            wr += float(self.rng.normal(0.0, 0.08))
+        return 0.5 * (wl + wr) * self.wheel_radius
+
+    def _apply_wheel_vel(self, w_l: float, w_r: float):
+        self.data.ctrl[self._act_l] = float(
+            np.clip(w_l, -self.max_wheel_vel, self.max_wheel_vel)
+        )
+        self.data.ctrl[self._act_r] = float(
+            np.clip(w_r, -self.max_wheel_vel, self.max_wheel_vel)
+        )
+
+    def _set_vw(self, v: float, w: float):
+        w_l = (v - 0.5 * w * self.track_width) / self.wheel_radius
+        w_r = (v + 0.5 * w * self.track_width) / self.wheel_radius
+        self._apply_wheel_vel(w_l, w_r)
+
+    def _count_wall_contacts(self) -> int:
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if (g1 in self._wall_geom_ids and g2 in self._bot_geom_ids) or (
+                g2 in self._wall_geom_ids and g1 in self._bot_geom_ids
+            ):
+                return 1
+        return 0
+
+    def _sim_tick(self):
+        if self.viewer is not None and hasattr(self.viewer, "lock"):
+            with self.viewer.lock():
+                mujoco.mj_step(self.model, self.data)
+        else:
+            mujoco.mj_step(self.model, self.data)
+
+        self.odom_yaw = _wrap_angle(
+            self.odom_yaw + self._read_gyro_z() * self.model.opt.timestep
+        )
+        hit = self._count_wall_contacts()
         if hit:
-            self.tick_collisions += 1
+            self.wall_hits += 1
+            self._move_wall_hits += 1
 
-        self._tick += 1
-        if self.viewer is not None and self._tick % 4 == 0:
+        if self.viewer is not None:
             self.viewer.sync()
             if self.render_realtime:
-                time.sleep(0.012)
+                time.sleep(self.model.opt.timestep)
 
-        return v_m, w_m, hit
+    # ------------------------------------------------------------------
+    # Odometry, Goal & Observation (20-Dim)
+    # ------------------------------------------------------------------
+    def _advance_odom_cell(self):
+        dc, dr = self.HEADING_DC_DR[self.odom_h]
+        self.odom_c += dc
+        self.odom_r += dr
+        key = (self.odom_r, self.odom_c)
+        self.visited_counts[key] = self.visited_counts.get(key, 0) + 1
 
-    def _clear_pid_integrators(self):
-        self.pid.int_v = 0.0
-        self.pid.int_w = 0.0
-        self.pid.prev_err_v = 0.0
-        self.pid.prev_err_w = 0.0
+    def _check_goal(self) -> bool:
+        gx, gy = self.maze["goal_xy"]
+        bx, by = float(self.data.qpos[0]), float(self.data.qpos[1])
+        return math.hypot(bx - gx, by - gy) < (self.cell_size * 0.38)
 
-    def _execute_move(self, action: int):
-        new_h = (self.odom_h + ACTION_DH[action]) % 4
-        target_theta = wrap_angle(new_h * (np.pi / 2.0))
-        hit_any = False
+    def _get_obs(self) -> np.ndarray:
+        rf = self._read_rangefinders()
+        cardinal = [rf["front"], rf["left"], rf["right"], rf["back"]]
 
-        # Phase A: In-place turn to exact cardinal heading
-        if action != 0:
-            self._clear_pid_integrators()
-            for _ in range(320):
-                err = wrap_angle(target_theta - self.pid.theta)
-                if action == 3 and abs(err) > 2.75:
-                    err = abs(err)
-                w_ref = float(np.clip(4.0 * err, -2.5, 2.5))
-                _, w_m, hit = self._sim_tick(0.0, w_ref)
-                hit_any = hit_any or hit
-                if abs(err) < 0.025 and abs(w_m) < 0.15:
-                    break
-
-        # Phase B: Drive 1 cell straight with corridor centering + front-wall alignment
-        self._clear_pid_integrators()
-        dist_traveled = 0.0
-        side_wall_max = self.side_center + 0.045
-
-        for _ in range(360):
-            prox = self._read_prox(noisy=False)
-            rf_f, rf_l, rf_r, rf_fl, rf_fr = prox[0], prox[1], prox[2], prox[3], prox[4]
-
-            if dist_traveled > 0.16 and rf_f < self.front_center + 0.065:
-                rem = rf_f - self.front_center
-            else:
-                rem = self.cell_size - dist_traveled
-
-            if rem <= 0.005:
-                break
-
-            v_ref = float(np.clip(3.2 * rem, 0.06, 0.34))
-            yaw_err = wrap_angle(target_theta - self.pid.theta)
-
-            if rf_l < side_wall_max and rf_r < side_wall_max:
-                e_lat = rf_l - rf_r
-            elif rf_l < side_wall_max:
-                e_lat = rf_l - self.side_center
-            elif rf_r < side_wall_max:
-                e_lat = self.side_center - rf_r
-            else:
-                e_lat = 0.0
-
-            w_ref = 3.5 * yaw_err + 10.0 * e_lat
-            if rf_fl < 0.036:
-                w_ref -= 1.2 * (0.036 - rf_fl) / 0.036
-            if rf_fr < 0.036:
-                w_ref += 1.2 * (0.036 - rf_fr) / 0.036
-            w_ref = float(np.clip(w_ref, -2.0, 2.0))
-
-            v_m, _, hit = self._sim_tick(v_ref, w_ref)
-            hit_any = hit_any or hit
-            dist_traveled += max(0.0, v_m) * self.dt
-
-        # Brief settle
-        for _ in range(12):
-            _, _, hit = self._sim_tick(0.0, 0.0)
-            hit_any = hit_any or hit
-
-        dr, dc = DIRS[new_h]
-        self.odom_r = int(np.clip(self.odom_r + dr, 0, self.rows - 1))
-        self.odom_c = int(np.clip(self.odom_c + dc, 0, self.cols - 1))
-        self.odom_h = new_h
-        self.pid.x = (self.odom_c + 0.5) * self.cell_size
-        self.pid.y = (self.odom_r + 0.5) * self.cell_size
-        return hit_any
-
-    def step(self, action):
-        action = int(action)
-        self.step_count += 1
-
-        prox = self._read_prox(noisy=False)
-        is_open = prox[ACTION_PROX[action]] > self.open_thresh[action]
-
-        reward = -0.1
-        terminated = False
-
-        if not is_open:
-            reward -= 1.0
-        else:
-            hit = self._execute_move(action)
-            if hit:
-                self.collision_steps += 1
-                reward -= 2.0
-
-            cell_odom = (self.odom_r, self.odom_c)
-            prev_cnt = self.visit_counts.get(cell_odom, 0)
-            self.visit_counts[cell_odom] = prev_cnt + 1
-
-            true_cell = self._clamped_cell(*self._true_xy())
-            if true_cell not in self.visited_true:
-                self.visited_true.add(true_cell)
-                reward += 1.5
-            else:
-                reward -= 0.25
-
-            curr_bfs = int(self.bfs_dist[true_cell])
-            if curr_bfs < self.min_bfs:
-                reward += 2.0 * float(self.min_bfs - curr_bfs)
-                self.min_bfs = curr_bfs
-
-            tx, ty = self._true_xy()
-            gx, gy = self.maze["goal_xy"]
-            if true_cell == self.goal_cell or float(np.hypot(gx - tx, gy - ty)) < 0.12:
-                reward += 30.0
-                if self.tick_collisions == 0:
-                    reward += 10.0
-                terminated = True
-
-        truncated = self.step_count >= self.max_steps
-        info = {
-            "is_success": terminated,
-            "collisions": self.collision_steps,
-            "tick_collisions": self.tick_collisions,
-            "cells_visited": len(self.visited_true),
-        }
-        return self._get_obs(), reward, terminated, truncated, info
-
-    def _read_prox(self, noisy: bool = True):
-        vals = []
-        for name in self.prox_names:
-            d = float(self.data.sensor(name).data[0])
-            d = self.max_range if d < 0 else min(d, self.max_range)
-            if noisy and self.noise_enabled:
-                d = float(np.clip(d + self.rng.normal(0.0, 0.008), 0.0, self.max_range))
-            vals.append(d)
-        return np.array(vals, dtype=np.float32)
-
-    def _get_obs(self):
-        prox = self._read_prox(noisy=True)
-        card_prox = prox[ACTION_PROX]
-        open_dirs = (card_prox > self.open_thresh).astype(np.float32)
-        prox_norm = card_prox / self.max_range
+        open_dirs = [1.0 if d > self.open_thresh else 0.0 for d in cardinal]
+        prox_norm = [min(d, self.max_range) / self.max_range for d in cardinal]
 
         adj_visited = []
         adj_counts = []
-        for dh in ACTION_DH:
-            h = (self.odom_h + dh) % 4
-            dr, dc = DIRS[h]
-            nc = (self.odom_r + dr, self.odom_c + dc)
-            cnt = self.visit_counts.get(nc, 0)
+        for rel_a in range(4):
+            h_adj = (self.odom_h + self.REL_DELTA_H[rel_a]) % 4
+            dc, dr = self.HEADING_DC_DR[h_adj]
+            cnt = self.visited_counts.get((self.odom_r + dr, self.odom_c + dc), 0)
             adj_visited.append(1.0 if cnt > 0 else 0.0)
             adj_counts.append(min(cnt, 4) / 4.0)
 
+        # Body-frame normalized goal bearing
+        dx_w = (self.goal_c - self.odom_c) * self.cell_size
+        dy_w = (self.goal_r - self.odom_r) * self.cell_size
+        dist_g = math.hypot(dx_w, dy_w)
+        if dist_g > 1e-6:
+            ux, uy = dx_w / dist_g, dy_w / dist_g
+        else:
+            ux, uy = 0.0, 0.0
+        cy, sy = math.cos(self.odom_yaw), math.sin(self.odom_yaw)
+        goal_local_x = ux * cy + uy * sy
+        goal_local_y = -ux * sy + uy * cy
+
+        obs = np.array(
+            open_dirs
+            + prox_norm
+            + adj_visited
+            + adj_counts
+            + [goal_local_x, goal_local_y, sy, cy],
+            dtype=np.float32,
+        )
+        return np.clip(obs, -1.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Low-Level Motion Primitives (200 Hz PD/PID)
+    # ------------------------------------------------------------------
+    def _compute_corridor_steering(self, rf: dict) -> float:
+        target_yaw = self.HEADING_YAW[self.odom_h]
+        yaw_err = _wrap_angle(target_yaw - self.odom_yaw)
+        gyro_z = self._read_gyro_z()
+
+        w_cmd = 5.0 * yaw_err - 0.22 * gyro_z
+
+        side_thresh = self.cell_size * 0.65
+        rf_l, rf_r = rf["left"], rf["right"]
+        if rf_l < side_thresh and rf_r < side_thresh:
+            w_cmd += 3.4 * (rf_l - rf_r)
+        elif rf_l < side_thresh:
+            w_cmd += 2.6 * (rf_l - self.side_center)
+        elif rf_r < side_thresh:
+            w_cmd += 2.6 * (self.side_center - rf_r)
+
+        diag_safe = 0.092
+        if rf["fl"] < diag_safe:
+            w_cmd -= 4.0 * (diag_safe - rf["fl"])
+        if rf["fr"] < diag_safe:
+            w_cmd += 4.0 * (diag_safe - rf["fr"])
+
+        return float(np.clip(w_cmd, -4.5, 4.5))
+
+    def _settle_stop(self, max_ticks: int = 6):
+        for _ in range(max_ticks):
+            self._apply_wheel_vel(0.0, 0.0)
+            self._sim_tick()
+            if abs(self._read_forward_speed()) < 0.025:
+                break
+
+    def turn_in_place(self, rel_action: int, max_ticks: int = 220):
+        """Phase A: High-gain PD-damped 90°/180° in-place turn."""
+        delta_h = self.REL_DELTA_H[int(rel_action)]
+        if delta_h == 0:
+            return
+        self.odom_h = (self.odom_h + delta_h) % 4
+        target_yaw = self.HEADING_YAW[self.odom_h]
+
+        settled = 0
+        for _ in range(max_ticks):
+            yaw_err = _wrap_angle(target_yaw - self.odom_yaw)
+            gyro_z = self._read_gyro_z()
+
+            if abs(yaw_err) < 0.018 and abs(gyro_z) < 0.20:
+                settled += 1
+                self._set_vw(0.0, 0.0)
+                self._sim_tick()
+                if settled >= 2:
+                    break
+            else:
+                settled = 0
+                w_cmd = float(np.clip(7.8 * yaw_err - 0.34 * gyro_z, -7.8, 7.8))
+                if abs(yaw_err) > 0.018 and abs(w_cmd) < 0.55:
+                    w_cmd = math.copysign(0.55, yaw_err)
+                self._set_vw(0.0, w_cmd)
+                self._sim_tick()
+
+        self._apply_wheel_vel(0.0, 0.0)
+
+    def _execute_move(
+        self,
+        rel_action: int,
+        cruise_speed: float = None,
+        brake_dist: float = None,
+        accel: float = None,
+        max_ticks: int = 280,
+    ):
+        """Standard stop-and-go cell move used during RL training and step()."""
+        cruise_speed = self.cruise_speed if cruise_speed is None else cruise_speed
+        brake_dist = self.brake_dist if brake_dist is None else brake_dist
+        accel = self.accel if accel is None else accel
+
+        self.turn_in_place(rel_action)
+
+        dist = 0.0
+        dt = self.model.opt.timestep
+        v_cmd = 0.12
+        a_brake = 0.85 * (cruise_speed ** 2) / (2.0 * brake_dist)
+
+        for _ in range(max_ticks):
+            rf = self._read_rangefinders()
+            rf_f = rf["front"]
+            remaining = max(0.0, self.cell_size - dist)
+            wall_rem = max(0.0, rf_f - self.front_center)
+            effective_rem = min(remaining, wall_rem)
+
+            if effective_rem <= brake_dist:
+                v_target = max(0.07, math.sqrt(2.0 * a_brake * effective_rem))
+                v_cmd = min(v_cmd, v_target)
+            else:
+                v_cmd = min(cruise_speed, v_cmd + accel * dt)
+
+            w_cmd = self._compute_corridor_steering(rf)
+            self._set_vw(v_cmd, w_cmd)
+            self._sim_tick()
+
+            dist += self._read_forward_speed() * dt
+
+            if dist > 0.16 and rf_f < self.front_center + 0.012:
+                break
+            if dist >= self.cell_size:
+                break
+
+        self._settle_stop()
+        self._advance_odom_cell()
+
+    def drive_cell_lookahead(
+        self,
+        peek_fn,
+        carry: float = 0.0,
+        brake_dist: float = None,
+        cruise_speed: float = None,
+        accel: float = None,
+        max_ticks: int = 280,
+    ) -> dict:
+        """
+        Phase B with front-wall-aware braking (15% safety margin) and
+        Lookahead Cruise-Through for non-stop straightaways.
+        """
+        cruise_speed = self.cruise_speed if cruise_speed is None else cruise_speed
+        brake_dist = self.brake_dist if brake_dist is None else brake_dist
+        accel = self.accel if accel is None else accel
+
+        dist = carry
+        peeked = False
+        next_action = None
+        stop_at_end = True
+        hit_wall = False
+        at_goal = False
+        peek_dist = self.cell_size - brake_dist  # 0.20 m
+        dt = self.model.opt.timestep
+        v_cmd = max(0.12, self._read_forward_speed())
+        a_brake = 0.85 * (cruise_speed ** 2) / (2.0 * brake_dist)
+
+        for _ in range(max_ticks):
+            rf = self._read_rangefinders()
+            rf_f = rf["front"]
+
+            if not peeked and dist >= peek_dist:
+                peeked = True
+                self._advance_odom_cell()
+                at_goal = self._check_goal()
+                obs = self._get_obs()
+
+                if at_goal:
+                    stop_at_end = True
+                else:
+                    next_action = int(peek_fn(obs))
+                    front_open = (obs[0] > 0.5) and (rf_f > self.cell_size * 0.85)
+                    stop_at_end = not (next_action == 0 and front_open)
+
+            remaining = max(0.0, self.cell_size - dist)
+            wall_rem = max(0.0, rf_f - self.front_center)
+            effective_rem = min(remaining, wall_rem) if stop_at_end else wall_rem
+
+            if effective_rem <= brake_dist:
+                v_target = max(0.07, math.sqrt(2.0 * a_brake * effective_rem))
+                v_cmd = min(v_cmd, v_target)
+            else:
+                v_cmd = min(cruise_speed, v_cmd + accel * dt)
+
+            w_cmd = self._compute_corridor_steering(rf)
+            self._set_vw(v_cmd, w_cmd)
+            self._sim_tick()
+
+            dist += self._read_forward_speed() * dt
+
+            if stop_at_end and dist > 0.16 and rf_f < self.front_center + 0.012:
+                break
+            if rf_f < self.front_center - 0.015:
+                hit_wall = True
+                stop_at_end = True
+                break
+            if dist >= self.cell_size:
+                break
+
+        if not peeked and dist > 0.15:
+            self._advance_odom_cell()
+
+        if stop_at_end:
+            self._settle_stop()
+            new_carry = 0.0
+        else:
+            new_carry = max(0.0, dist - self.cell_size)
+
+        return {
+            "next_action": next_action,
+            "stopped": stop_at_end,
+            "carry": new_carry,
+            "hit_wall": hit_wall,
+            "at_goal": at_goal or self._check_goal(),
+        }
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            maze_seed = int(seed)
+        else:
+            maze_seed = int(self.base_seed + self.rng.integers(0, self.pool_size))
+
+        self.model, self.data, self.maze = build_maze_scene(
+            self.buggy_xml_path,
+            rows=self.rows,
+            cols=self.cols,
+            cell_size=self.cell_size,
+            seed=maze_seed,
+        )
+        self._cache_ids()
+
+        sx, sy = self.maze["start_xy"]
         gx, gy = self.maze["goal_xy"]
-        dx_w = gx - self.pid.x
-        dy_w = gy - self.pid.y
-        c, s = np.cos(self.pid.theta), np.sin(self.pid.theta)
-        max_diag = np.hypot(self.cols * self.cell_size, self.rows * self.cell_size)
-        goal_local = np.clip([(c * dx_w + s * dy_w) / max_diag, (-s * dx_w + c * dy_w) / max_diag], -1.0, 1.0)
+        self.odom_c = int(sx // self.cell_size)
+        self.odom_r = int(sy // self.cell_size)
+        self.goal_c = int(gx // self.cell_size)
+        self.goal_r = int(gy // self.cell_size)
+        self.odom_h = 0
+        self.odom_yaw = 0.0
+        self.visited_counts = {(self.odom_r, self.odom_c): 1}
+        self.moves = 0
+        self.wall_hits = 0
+        self.collision_moves = 0
+        self._move_wall_hits = 0
 
-        return np.concatenate([
-            open_dirs,
-            prox_norm,
-            adj_visited,
-            adj_counts,
-            goal_local,
-            [s, c],
-        ]).astype(np.float32)
+        for _ in range(10):
+            self._apply_wheel_vel(0.0, 0.0)
+            self._sim_tick()
+        self.wall_hits = 0
+        self._move_wall_hits = 0
 
-    def _true_xy(self):
-        pos = self.data.body("bot/buggy").xpos
-        return float(pos[0]), float(pos[1])
+        return self._get_obs(), {"maze_seed": maze_seed}
 
-    def _clamped_cell(self, x: float, y: float):
-        r = int(np.clip(np.floor(y / self.cell_size), 0, self.rows - 1))
-        c = int(np.clip(np.floor(x / self.cell_size), 0, self.cols - 1))
-        return (r, c)
+    def step(self, action):
+        action = int(action)
+        self.moves += 1
+        self._move_wall_hits = 0
 
-    def _check_wall_collision(self):
-        for i in range(self.data.ncon):
-            con = self.data.contact[i]
-            g1, g2 = int(con.geom1), int(con.geom2)
-            if (g1 in self.wall_ids and g2 in self.bot_ids) or (
-                g2 in self.wall_ids and g1 in self.bot_ids
-            ):
-                return True
-        return False
+        obs_before = self._get_obs()
+        old_dist = abs(self.goal_r - self.odom_r) + abs(self.goal_c - self.odom_c)
+
+        if obs_before[action] < 0.5:
+            reward = -1.0
+            terminated = False
+            truncated = self.moves >= self.max_moves
+            info = {
+                "is_success": False,
+                "blocked": True,
+                "wall_hits": self.wall_hits,
+                "collision_moves": self.collision_moves,
+            }
+            return obs_before, reward, terminated, truncated, info
+
+        self._execute_move(action)
+        if self._move_wall_hits > 0:
+            self.collision_moves += 1
+
+        new_dist = abs(self.goal_r - self.odom_r) + abs(self.goal_c - self.odom_c)
+        visits = self.visited_counts.get((self.odom_r, self.odom_c), 1)
+        at_goal = self._check_goal()
+
+        reward = -0.05 + 0.15 * (old_dist - new_dist)
+        if visits == 1:
+            reward += 0.25
+        else:
+            reward -= 0.10 * min(visits - 1, 3)
+        if self._move_wall_hits > 0:
+            reward -= 0.5
+        if at_goal:
+            reward += 10.0
+
+        terminated = at_goal
+        truncated = (not terminated) and (self.moves >= self.max_moves)
+        info = {
+            "is_success": at_goal,
+            "blocked": False,
+            "wall_hits": self.wall_hits,
+            "collision_moves": self.collision_moves,
+        }
+        return self._get_obs(), float(reward), terminated, truncated, info

@@ -43,8 +43,8 @@
   </worldbody>
 
   <actuator>
-    <velocity name="left_vel"  joint="left_wheel_joint"  kv="0.05" ctrlrange="-30 30" forcerange="-0.5 0.5"/>
-    <velocity name="right_vel" joint="right_wheel_joint" kv="0.05" ctrlrange="-30 30" forcerange="-0.5 0.5"/>
+    <velocity name="left_vel"  joint="left_wheel_joint"  kv="0.5" ctrlrange="-40 40" forcerange="-2 2"/>
+    <velocity name="right_vel" joint="right_wheel_joint" kv="0.5" ctrlrange="-40 40" forcerange="-2 2"/>
   </actuator>
 
   <sensor>
