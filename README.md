@@ -59,7 +59,7 @@ The system decouples **strategic maze exploration** from **precise physical moti
 
 ### 1. Clone & Create Virtual Environment
 ```bash
-git clone [https://github.com/nlskarthik007/RL_Maze_Buggy.git]
+git clone https://github.com/nlskarthik007/RL_Maze_Buggy.git
 cd RL_Maze_Buggy
 
 python3 -m venv .venv
